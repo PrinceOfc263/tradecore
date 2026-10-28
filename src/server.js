@@ -186,6 +186,17 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many requests. Please try again shortly.' }
 });
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    const origin = req.get('origin');
+    if (origin) {
+      try { if (new URL(origin).host !== req.get('host')) return res.status(403).json({ error: 'Cross-origin request blocked.' }); }
+      catch { return res.status(403).json({ error: 'Invalid request origin.' }); }
+    }
+  }
+  next();
+});
 app.use('/api', apiLimiter);
 
 const scenarioInput = z.object({
@@ -230,6 +241,15 @@ function establishSession(req, user) {
 function requireAccount(req, res, next) {
   if (!req.session.userId) return res.status(401).json({ error: 'Sign in to access saved scenarios.' });
   next();
+}
+
+async function requireAdmin(req, res, next) {
+  if (!req.session.userId) return res.status(401).json({ error: 'Sign in to access this page.' });
+  try {
+    const { rows } = await pool.query('SELECT role FROM northstar_users WHERE id = $1', [req.session.userId]);
+    if (rows[0]?.role !== 'admin') return res.status(403).json({ error: 'Administrator access is required.' });
+    next();
+  } catch (error) { next(error); }
 }
 
 async function getDerivConnection(userId) {
@@ -388,6 +408,23 @@ app.get('/api/v1/health', async (_req, res) => {
   }
 });
 
+app.get('/api/v1/admin/overview', requireAdmin, async (_req, res, next) => {
+  try {
+    const [{ rows: users }, { rows: connections }, health] = await Promise.all([
+      pool.query('SELECT COUNT(*)::int AS count FROM northstar_users'),
+      pool.query('SELECT COUNT(*)::int AS count FROM deriv_connections'),
+      pool.query('SELECT 1 AS ok')
+    ]);
+    res.json({
+      registeredUsers: users[0].count,
+      brokerConnections: connections[0].count,
+      database: health.rows[0]?.ok ? 'connected' : 'degraded',
+      providers: { derivMarkets: true, derivOAuth: Boolean(process.env.DERIV_APP_ID?.trim() && process.env.DERIV_REDIRECT_URI?.trim()), gemini: Boolean(process.env.GEMINI_API_KEY?.trim()) },
+      asOf: new Date().toISOString()
+    });
+  } catch (error) { next(error); }
+});
+
 app.get('/api/v1/providers', (_req, res) => {
   const derivAppIdConfigured = Boolean(process.env.DERIV_APP_ID?.trim());
   const derivRedirectUriConfigured = Boolean(process.env.DERIV_REDIRECT_URI?.trim());
@@ -502,9 +539,13 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many sign-in attempts. Please wait and try again.' }
 });
-app.get('/api/v1/auth/me', (req, res) => {
+app.get('/api/v1/auth/me', async (req, res, next) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Not signed in.' });
-  res.json({ user: { id: req.session.userId, name: req.session.userName, email: req.session.userEmail } });
+  try {
+    const { rows } = await pool.query('SELECT role FROM northstar_users WHERE id = $1', [req.session.userId]);
+    if (!rows[0]) return res.status(401).json({ error: 'Account no longer exists.' });
+    res.json({ user: { id: req.session.userId, name: req.session.userName, email: req.session.userEmail, role: rows[0].role } });
+  } catch (error) { next(error); }
 });
 
 app.post('/api/v1/auth/register', authLimiter, async (req, res, next) => {
@@ -514,13 +555,13 @@ app.post('/api/v1/auth/register', authLimiter, async (req, res, next) => {
   try {
     const credentials = await passwordDigest(parsed.data.password);
     const { rows } = await pool.query(
-      'INSERT INTO northstar_users (display_name, email, password_salt, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, display_name, email',
+      'INSERT INTO northstar_users (display_name, email, password_salt, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, display_name, email, role',
       [parsed.data.name, email, credentials.salt, credentials.hash]
     );
     const user = rows[0];
     await pool.query('UPDATE trade_scenarios SET user_id = $1 WHERE session_id = $2 AND user_id IS NULL', [user.id, req.sessionID]);
     await establishSession(req, user);
-    res.status(201).json({ user: { id: user.id, name: user.display_name, email: user.email } });
+    res.status(201).json({ user: { id: user.id, name: user.display_name, email: user.email, role: user.role } });
   } catch (error) {
     if (error.code === '23505') return res.status(409).json({ error: 'An account with this email already exists. Sign in instead.' });
     next(error);
@@ -533,7 +574,7 @@ app.post('/api/v1/auth/login', authLimiter, async (req, res, next) => {
   try {
     const email = parsed.data.email.toLowerCase();
     const { rows } = await pool.query(
-      'SELECT id, display_name, email, password_salt, password_hash FROM northstar_users WHERE email = $1 LIMIT 1',
+      'SELECT id, display_name, email, password_salt, password_hash, role FROM northstar_users WHERE email = $1 LIMIT 1',
       [email]
     );
     const user = rows[0];
@@ -544,7 +585,7 @@ app.post('/api/v1/auth/login', authLimiter, async (req, res, next) => {
     if (!user || !matches) return res.status(401).json({ error: 'Email or password is incorrect.' });
     await pool.query('UPDATE trade_scenarios SET user_id = $1 WHERE session_id = $2 AND user_id IS NULL', [user.id, req.sessionID]);
     await establishSession(req, user);
-    res.json({ user: { id: user.id, name: user.display_name, email: user.email } });
+    res.json({ user: { id: user.id, name: user.display_name, email: user.email, role: user.role } });
   } catch (error) {
     next(error);
   }
@@ -626,9 +667,13 @@ async function start() {
       email varchar(254) NOT NULL UNIQUE,
       password_salt varchar(32) NOT NULL,
       password_hash varchar(128) NOT NULL,
+      role varchar(16) NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')),
       created_at timestamptz NOT NULL DEFAULT now()
     )
   `);
+  await pool.query("ALTER TABLE northstar_users ADD COLUMN IF NOT EXISTS role varchar(16) NOT NULL DEFAULT 'user'");
+  const adminEmail = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+  if (adminEmail) await pool.query("UPDATE northstar_users SET role = 'admin' WHERE lower(email) = $1", [adminEmail]);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS northstar_sessions (
       sid varchar NOT NULL PRIMARY KEY,
