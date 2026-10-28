@@ -39,10 +39,11 @@ const marketQuery = z.object({
 const marketDataCacheMs = 15_000;
 
 async function getMarkets(keys, granularity, count) {
-  const cacheKey = `${keys.slice().sort().join(',')}:${granularity}:${count}`;
+  const marketKeys = Array.isArray(keys) ? keys : [];
+  const cacheKey = `${marketKeys.slice().sort().join(',')}:${granularity}:${count}`;
   const cached = marketCache.get(cacheKey);
   if (cached && Date.now() - cached.at < marketDataCacheMs) return cached.data;
-  const data = await fetchDerivMarkets({ keys, granularity, count });
+  const data = await fetchDerivMarkets({ keys: marketKeys, granularity, count });
   marketCache.set(cacheKey, { at: Date.now(), data });
   return data;
 }
