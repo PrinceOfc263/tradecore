@@ -256,7 +256,8 @@ function normalizeDerivAccounts(payload) {
 app.get('/api/v1/connections/deriv/start', requireAccount, (req, res) => {
   const appId = process.env.DERIV_APP_ID;
   const redirectUri = process.env.DERIV_REDIRECT_URI;
-  if (!appId || !redirectUri) return res.redirect('/?connection=deriv-unconfigured');
+  if (!appId?.trim()) return res.redirect('/?connection=deriv-app-id-missing');
+  if (!redirectUri?.trim()) return res.redirect('/?connection=deriv-redirect-uri-missing');
   const verifier = crypto.randomBytes(48).toString('base64url');
   const state = crypto.randomBytes(32).toString('base64url');
   const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
@@ -387,10 +388,14 @@ app.get('/api/v1/health', async (_req, res) => {
 });
 
 app.get('/api/v1/providers', (_req, res) => {
+  const derivAppIdConfigured = Boolean(process.env.DERIV_APP_ID?.trim());
+  const derivRedirectUriConfigured = Boolean(process.env.DERIV_REDIRECT_URI?.trim());
   res.json({
     markets: 'Deriv public market data',
     geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
-    derivOAuthConfigured: Boolean(process.env.DERIV_APP_ID && process.env.DERIV_REDIRECT_URI)
+    derivAppIdConfigured,
+    derivRedirectUriConfigured,
+    derivOAuthConfigured: derivAppIdConfigured && derivRedirectUriConfigured
   });
 });
 
