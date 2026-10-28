@@ -191,7 +191,7 @@ app.use('/api', (req, res, next) => {
   if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     const origin = req.get('origin');
     if (origin) {
-      try { if (new URL(origin).host !== req.get('host')) return res.status(403).json({ error: 'Cross-origin request blocked.' }); }
+      try { if (new URL(origin).origin !== new URL(`${req.protocol}://${req.get('host')}`).origin) return res.status(403).json({ error: 'Cross-origin request blocked.' }); }
       catch { return res.status(403).json({ error: 'Invalid request origin.' }); }
     }
   }
