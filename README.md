@@ -1,6 +1,6 @@
 # Northstar
 
-Northstar is a responsive trading intelligence dashboard prototype. It brings market context, AI-assisted research, signal cards, rule-based alerts, broker connections, payments, WhatsApp notifications, and subscription tiers into one workspace.
+Northstar is a responsive trading intelligence dashboard prototype. It brings market context, AI-assisted research, signal cards, a trade risk planner, rule-based alerts, broker connections, payments, WhatsApp notifications, and subscription tiers into one workspace.
 
 ## Run locally
 
@@ -8,7 +8,7 @@ Open `index.html` in a browser. The prototype has no build step or external runt
 
 ## Prototype boundaries
 
-This repository currently contains a front-end demo. Prices, signals, portfolio balances, AI replies, and transactions are illustrative. The demo does not place trades, connect to a broker, send WhatsApp messages, or move money.
+This repository currently contains a front-end demo. Prices, signals, portfolio balances, AI replies, and transactions are illustrative. The demo does not place trades, connect to a broker, send WhatsApp messages, or move money. Trade planner scenarios are saved only in the current browser using local storage; calculations are estimates and exclude fees, slippage, contract multipliers, leverage, and currency conversion.
 
 Before enabling real accounts or funds, add a secure backend and:
 
