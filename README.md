@@ -1,6 +1,6 @@
 # Northstar
 
-Northstar is a responsive trading workspace with a Node.js API and PostgreSQL persistence. It provides Deriv market data, candle charts, rule-based technical readings, Gemini market research, a risk planner, and an optional OAuth connection for reading a Deriv account.
+Northstar is a responsive trading workspace with a Node.js API and PostgreSQL persistence. It provides Deriv market data, a searchable catalog of active Deriv symbols, selectable candle charts refreshed from provider history, rule-based technical readings, Gemini market research, a risk planner, and an optional OAuth connection for reading a Deriv account.
 
 ## Run locally
 

@@ -9,7 +9,7 @@ import helmet from 'helmet';
 import pg from 'pg';
 import { z } from 'zod';
 import WebSocket from 'ws';
-import { fetchDerivMarkets, getAvailableMarketKeys } from './deriv-market-data.js';
+import { fetchDerivMarkets, fetchDerivMarketCatalog } from './deriv-market-data.js';
 
 const { Pool } = pg;
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
@@ -32,6 +32,7 @@ const pool = new Pool({
   application_name: 'northstar-api'
 });
 const marketCache = new Map();
+let marketCatalogCache = { at: 0, markets: [] };
 const marketQuery = z.object({
   granularity: z.coerce.number().int().optional().default(3600),
   count: z.coerce.number().int().min(2).max(365).optional().default(24)
@@ -46,6 +47,13 @@ async function getMarkets(keys, granularity, count) {
   const data = await fetchDerivMarkets({ keys: marketKeys, granularity, count });
   marketCache.set(cacheKey, { at: Date.now(), data });
   return data;
+}
+
+async function getMarketCatalog() {
+  if (marketCatalogCache.markets.length && Date.now() - marketCatalogCache.at < 5 * 60_000) return marketCatalogCache.markets;
+  const markets = await fetchDerivMarketCatalog();
+  marketCatalogCache = { at: Date.now(), markets };
+  return markets;
 }
 
 function ema(values, period) {
@@ -437,6 +445,15 @@ app.get('/api/v1/providers', (_req, res) => {
   });
 });
 
+app.get('/api/v1/markets/catalog', async (_req, res) => {
+  try {
+    const markets = await getMarketCatalog();
+    res.json({ source: 'Deriv active symbols', updatedAt: new Date(marketCatalogCache.at).toISOString(), count: markets.length, markets });
+  } catch {
+    res.status(503).json({ error: 'Deriv market catalog is temporarily unavailable.' });
+  }
+});
+
 app.get('/api/v1/markets', async (req, res) => {
   const parsed = marketQuery.safeParse(req.query);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid market-data interval.' });
@@ -450,12 +467,14 @@ app.get('/api/v1/markets', async (req, res) => {
 });
 
 app.get('/api/v1/markets/:asset/history', async (req, res) => {
-  const key = String(req.params.asset || '').toUpperCase();
-  if (!getAvailableMarketKeys().some(item => item.key === key)) return res.status(404).json({ error: 'Unknown market.' });
+  const requestedKey = String(req.params.asset || '');
   const parsed = marketQuery.safeParse(req.query);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid market-data interval.' });
   try {
-    const markets = await getMarkets([key], parsed.data.granularity, parsed.data.count);
+    const catalog = await getMarketCatalog();
+    const marketDefinition = catalog.find(item => item.key === requestedKey || item.symbol === requestedKey || item.key.toUpperCase() === requestedKey.toUpperCase());
+    if (!marketDefinition) return res.status(404).json({ error: 'That instrument is not in Deriv’s active market catalog.' });
+    const markets = await getMarkets([marketDefinition.key], parsed.data.granularity, parsed.data.count);
     const market = markets[0];
     if (!market) return res.status(503).json({ error: 'No live candles are available for this market.' });
     res.json(market);
