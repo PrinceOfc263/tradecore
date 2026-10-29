@@ -583,4 +583,193 @@ app.post('/api/v1/auth/register', authLimiter, async (req, res, next) => {
   try {
     const credentials = await passwordDigest(parsed.data.password);
     const { rows } = await pool.query(
-      'INSERT INTO northstar_users (d
+      'INSERT INTO northstar_users (display_name, email, password_salt, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, display_name, email, role',
+      [parsed.data.name, email, credentials.salt, credentials.hash]
+    );
+    const user = rows[0];
+    await pool.query('UPDATE trade_scenarios SET user_id = $1 WHERE session_id = $2 AND user_id IS NULL', [user.id, req.sessionID]);
+    await establishSession(req, user);
+    res.status(201).json({ user: { id: user.id, name: user.display_name, email: user.email, role: user.role } });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'An account with this email already exists. Sign in instead.' });
+    next(error);
+  }
+});
+
+app.post('/api/v1/auth/login', authLimiter, async (req, res, next) => {
+  const parsed = loginInput.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Enter a valid email and password.' });
+  try {
+    const email = parsed.data.email.toLowerCase();
+    const { rows } = await pool.query(
+      'SELECT id, display_name, email, password_salt, password_hash, role FROM northstar_users WHERE email = $1 LIMIT 1',
+      [email]
+    );
+    const user = rows[0];
+    const salt = user?.password_salt || 'northstar-invalid-user-salt';
+    const actual = await scrypt(parsed.data.password, salt, 64);
+    const expected = Buffer.from(user?.password_hash || '00'.repeat(64), 'hex');
+    const matches = expected.length === actual.length && crypto.timingSafeEqual(actual, expected);
+    if (!user || !matches) return res.status(401).json({ error: 'Email or password is incorrect.' });
+    await pool.query('UPDATE trade_scenarios SET user_id = $1 WHERE session_id = $2 AND user_id IS NULL', [user.id, req.sessionID]);
+    await establishSession(req, user);
+    res.json({ user: { id: user.id, name: user.display_name, email: user.email, role: user.role } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/v1/account/settings', requireAccount, async (req, res, next) => {
+  try {
+    await pool.query('INSERT INTO northstar_user_settings (user_id, preferences) VALUES ($1, $2::jsonb) ON CONFLICT (user_id) DO NOTHING', [req.session.userId, JSON.stringify(accountSettingsDefaults)]);
+    const { rows } = await pool.query('SELECT preferences, updated_at FROM northstar_user_settings WHERE user_id = $1', [req.session.userId]);
+    res.json({ settings: { ...accountSettingsDefaults, ...(rows[0]?.preferences || {}) }, updatedAt: rows[0]?.updated_at });
+  } catch (error) { next(error); }
+});
+
+app.put('/api/v1/account/settings', requireAccount, async (req, res, next) => {
+  const parsed = accountSettingsInput.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Check your settings and try again.' });
+  try {
+    const { rows } = await pool.query('INSERT INTO northstar_user_settings (user_id, preferences) VALUES ($1, $2::jsonb) ON CONFLICT (user_id) DO UPDATE SET preferences = EXCLUDED.preferences, updated_at = NOW() RETURNING preferences, updated_at', [req.session.userId, JSON.stringify(parsed.data)]);
+    res.json({ settings: rows[0].preferences, updatedAt: rows[0].updated_at });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/v1/auth/logout', requireAccount, (req, res, next) => {
+  req.session.destroy(error => {
+    if (error) return next(error);
+    res.clearCookie('northstar.sid', { httpOnly: true, secure: isProduction, sameSite: 'lax' });
+    res.status(204).end();
+  });
+});
+
+app.post('/api/v1/risk/estimate', (req, res) => {
+  const parsed = scenarioInput.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Check the scenario values and try again.' });
+  const result = estimateScenario(parsed.data);
+  if (result.error) return res.status(422).json({ error: result.error });
+  res.json(result);
+});
+
+app.get('/api/v1/scenarios', requireAccount, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, payload, created_at FROM trade_scenarios WHERE user_id = $1 ORDER BY created_at DESC LIMIT 8',
+      [req.session.userId]
+    );
+    res.json(rows.map(serializeScenario));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/v1/scenarios', requireAccount, async (req, res, next) => {
+  const parsed = scenarioInput.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Check the scenario values and try again.' });
+  const payload = estimateScenario(parsed.data);
+  if (payload.error) return res.status(422).json({ error: payload.error });
+
+  try {
+    const id = crypto.randomUUID();
+    const { rows } = await pool.query(
+      'INSERT INTO trade_scenarios (id, session_id, user_id, payload) VALUES ($1, $2, $3, $4::jsonb) RETURNING id, payload, created_at',
+      [id, req.sessionID, req.session.userId, JSON.stringify(payload)]
+    );
+    res.status(201).json(serializeScenario(rows[0]));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/v1/scenarios/:id', requireAccount, async (req, res, next) => {
+  const id = z.string().uuid().safeParse(req.params.id);
+  if (!id.success) return res.status(400).json({ error: 'Invalid scenario id.' });
+  try {
+    await pool.query('DELETE FROM trade_scenarios WHERE id = $1 AND user_id = $2', [id.data, req.session.userId]);
+    res.status(204).end();
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/', (_req, res) => res.sendFile(path.join(repoRoot, 'index.html')));
+app.get('/index.html', (_req, res) => res.sendFile(path.join(repoRoot, 'index.html')));
+const appPages = new Set(['overview', 'markets', 'copilot', 'signals', 'planner', 'automation', 'wallet', 'connections', 'plans', 'settings', 'admin']);
+app.get('/:page', (req, res, next) => appPages.has(req.params.page) ? res.sendFile(path.join(repoRoot, 'index.html')) : next());
+
+app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found.' }));
+app.use((error, _req, res, _next) => {
+  if (error?.type === 'entity.parse.failed') return res.status(400).json({ error: 'Request body must be valid JSON.' });
+  if (error?.type === 'entity.too.large') return res.status(413).json({ error: 'Request body is too large.' });
+  console.error('Request failed:', error?.message || 'Unknown error');
+  res.status(500).json({ error: 'The request could not be completed.' });
+});
+
+async function start() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS northstar_users (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      display_name varchar(80) NOT NULL,
+      email varchar(254) NOT NULL UNIQUE,
+      password_salt varchar(32) NOT NULL,
+      password_hash varchar(128) NOT NULL,
+      role varchar(16) NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+  await pool.query("ALTER TABLE northstar_users ADD COLUMN IF NOT EXISTS role varchar(16) NOT NULL DEFAULT 'user'");
+  const adminEmail = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+  if (adminEmail) await pool.query("UPDATE northstar_users SET role = 'admin' WHERE lower(email) = $1", [adminEmail]);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS northstar_sessions (
+      sid varchar NOT NULL PRIMARY KEY,
+      sess json NOT NULL,
+      expire timestamp(6) NOT NULL
+    )
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS northstar_sessions_expire_idx ON northstar_sessions (expire)');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS northstar_user_settings (
+      user_id uuid PRIMARY KEY REFERENCES northstar_users(id) ON DELETE CASCADE,
+      preferences jsonb NOT NULL DEFAULT '{"plannerCurrency":"USD","defaultMarket":"BTCUSD","defaultTimeframe":"1m","timeZone":"local","appearance":"system"}'::jsonb,
+      updated_at timestamptz NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trade_scenarios (
+      id uuid PRIMARY KEY,
+      session_id text NOT NULL,
+      payload jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS trade_scenarios_session_created_idx ON trade_scenarios (session_id, created_at DESC)');
+  await pool.query('ALTER TABLE trade_scenarios ADD COLUMN IF NOT EXISTS user_id uuid REFERENCES northstar_users(id) ON DELETE CASCADE');
+  await pool.query('CREATE INDEX IF NOT EXISTS trade_scenarios_user_created_idx ON trade_scenarios (user_id, created_at DESC)');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS deriv_connections (
+      user_id uuid PRIMARY KEY REFERENCES northstar_users(id) ON DELETE CASCADE,
+      access_token_ciphertext text NOT NULL,
+      expires_at timestamptz NOT NULL,
+      selected_account_id varchar(40),
+      created_at timestamptz NOT NULL DEFAULT NOW(),
+      updated_at timestamptz NOT NULL DEFAULT NOW()
+    )
+  `);
+  const server = app.listen(port, '0.0.0.0', () => console.log(`Northstar API listening on ${port}`));
+
+  async function shutdown() {
+    server.close(async () => {
+      await pool.end();
+      process.exit(0);
+    });
+  }
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}
+
+start().catch(error => {
+  console.error('Northstar could not start:', error.message);
+  process.exit(1);
+});
